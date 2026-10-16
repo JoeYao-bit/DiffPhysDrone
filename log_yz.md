@@ -791,7 +791,6 @@ if __name__ == '__main__':
 
 
 ### 测试日志保存目录
-
 测试视频按照时间记录在swarm下面的文件夹：
 
 /home/yaozhuo/code/validation_code/swarm_v1/swarm/exps_2.5/
@@ -914,3 +913,14 @@ DiffPhysDrone 这种基于视觉 + 可微物理学习的端到端避障，本质
 20261016
 
 接下来搭建一个单机多障碍的测试环境，无人机慢速追踪某个慢速移动目标
+
+
+### 仿真环境文件
+
+/home/yaozhuo/code/validation_code/swarm_v1/swarm/LinuxNoEditor/Scaffold/Binaries/Linux/Blocks
+
+二进制地图文件
+
+由文件./LinuxNoEditor/Blocks.sh 加载
+
+Ubuntu 不能做：UE 关卡可视化编辑（删除 Blocks 自带墙体）
