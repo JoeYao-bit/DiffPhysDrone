@@ -277,3 +277,67 @@ python main_cuda.py $(cat configs/single_agent.args) --resume ./checkpoint0000.p
 python main_cuda.py $(cat configs/single_agent.args) --resume ./checkpoint0000.pth --eval_only
 
 `checkpoint0001.pth` 是**在 0000 保存时刻的基础上，继续跑更多迭代之后，新保存的快照**。
+
+#  可以，训练过程中支持做评估，两种方式
+
+> 
+> 评估 = 加载当前网络权重，跑仿真、算指标、生成轨迹图；**评估阶段不会更新网络参数，不会破坏训练**。
+
+## 方式 1：自动周期性评估（推荐，写在训练启动参数里）
+
+在你的 `single_agent.args` 配置文件增加参数：
+
+```
+--eval_every 10000
+```
+
+含义：**每训练 10000 次迭代，自动暂停训练，执行一轮评估**，评估完成后自动回到训练继续跑。
+
+- 评估时会跑仿真，若代码支持，输出轨迹 png、打印评估指标
+- 缺点：每轮评估会占用 GPU 算力，**整体训练速度变慢**
+
+查看当前是否配置了这个参数：
+
+```
+cd /workspace/DiffPhysDrone
+cat configs/single_agent.args | grep eval_every
+```
+
+## 方式 2：手动手动单独开终端评估（**不打断正在运行的训练！推荐你现在用**）
+
+> 
+> 训练脚本继续在原来终端后台 / 前台跑，**不停止训练**。新开一个`docker exec`终端进容器。
+
+1. 新开容器终端，进入项目目录
+
+```
+docker exec -it diffphysdrone /bin/bash
+cd /workspace/DiffPhysDrone
+```
+
+2. 挑选当前最新的 ckpt（比如`checkpoint0001.pth`）执行评估
+
+```
+python main_cuda.py $(cat configs/single_agent.args) --resume ./checkpoint0001.pth --eval_only
+```
+
+- `--eval_only`：只推理评估，**不更新权重、不启动训练**
+- 训练主进程完全不受影响，两个进程独立运行
+- 评估会读取这个 ckpt 快照的权重，不是实时读取内存里正在训练的网络（这点很关键！）
+
+#  GitHub Release 页面在哪里（网页端操作）
+
+仓库地址：`https://github.com/JoeYao-bit/DiffPhysDrone`
+
+1. 打开这个仓库主页
+2. 页面右侧栏，找到 **Releases** 栏目（一般在 Star/Fork 下面），点进去就是 Release 页面
+   - 分支`yz_20261014`只是代码分支，Release 是**整个仓库**的发布包，**不是在分支里面**
+   - 很多人找不到：因为这个 fork 仓库**可能根本没有上传任何 Release 附件！**
+
+> 
+> 重点：`JoeYao-bit/DiffPhysDrone`是原作者的 fork 分支，**Release 在原始仓库 HenryHuYu/DiffPhysDrone**
+> 原始仓库：[https://github.com/HenryHuYu/DiffPhysDrone](https://github.com/HenryHuYu/DiffPhysDrone)
+> 👉 原始仓库右侧 Releases：[https://github.com/HenryHuYu/DiffPhysDrone/releases](https://github.com/HenryHuYu/DiffPhysDrone/releases)
+
+> 
+> 你 Readme 里面写的仿真验证包（LinuxNoEditor 虚幻引擎 Blocks.sh）是放在**原始仓库 Release 的附件**。
