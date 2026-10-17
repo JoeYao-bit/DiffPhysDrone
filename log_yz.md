@@ -317,7 +317,7 @@ cd <path to multi agent code supplementary>
 
 测试指定模型(/home/yaozhuo/code/DiffPhysDrone/checkpoint0004.pth)
 
-(airsim_eval) ➜  swarm python eval.py --resume /home/yaozhuo/code/DiffPhysDrone/checkpoint0004.pth --target_speed 2.5
+python eval.py --resume /home/yaozhuo/code/DiffPhysDrone/checkpoint0004.pth --target_speed 2.5
 
 
 high_speed_flight_v1是告诉测试，需要20.04相关ros版本
@@ -924,3 +924,163 @@ DiffPhysDrone 这种基于视觉 + 可微物理学习的端到端避障，本质
 由文件./LinuxNoEditor/Blocks.sh 加载
 
 Ubuntu 不能做：UE 关卡可视化编辑（删除 Blocks 自带墙体）
+
+
+### AirSim环境文件下载地址
+
+https://github.com/microsoft/AirSim/releases
+
+
+
+## 加载足球场环境成功
+
+cd /home/yaozhuo/code/validation_code/MSBuild2018(soccer_filed)/
+
+
+./LinuxNoEditor/MSBuild2018.sh -ResX=896 -ResY=504 -windowed -WinX=512 -WinY=304 -settings=$PWD/settings.json
+
+
+探索仿界面如何视角可调，鼠标可见
+
+
+
+### 仿真界面解决两个问题：**视角固定 + 鼠标消失**
+
+根源：`settings.json`里的`ViewMode`默认是`FlyWithMe`（跟随无人机，视角锁死），虚幻引擎窗口会捕获鼠标，导致看不见光标。
+
+> 
+> ⚠️ 重点：**不用改启动 sh 命令，修改 settings.json**，你的 eval、动态生成圆柱代码完全不变。
+
+ 1. 修改 settings.json，开启手动自由视角
+
+创建 / 修改你的`settings.json`，核心是设置`"ViewMode":"Manual"`。
+
+```
+{
+    "SettingsVersion": 1.2,
+    "SimMode": "Multirotor",
+    "ViewMode": "Manual"
+}
+```
+
+- `"ViewMode":"Manual"` = 相机不再自动跟随无人机，**WASD 移动相机，鼠标旋转视角**，自由漫游场景Microsoft ...
+- 键盘快捷键（Manual 模式）：
+  - `W/A/S/D`：前后左右移动相机
+  - `Q/E`：上升 / 下降
+  - 鼠标拖动：旋转视角
+  - `F1`：查看全部快捷键帮助
+
+> 
+> 注意：AirSim 加载顺序：优先读取命令行`-settings=`指定的 json，所以你启动命令里`-settings=$PWD/settings.json`是生效的。
+
+ 2. 鼠标看不见的问题（Unreal 引擎特性）
+
+AirSim 的虚幻打包程序默认**捕获鼠标，隐藏系统光标**，这是 UE4 独立打包程序的固有行为，分 2 种情况：
+
+1. **窗口激活时：鼠标被捕获，看不到光标，但是移动鼠标可以旋转视角（Manual 模式）**
+   - 想临时释放鼠标：**Alt+Tab 切到别的窗口，鼠标就恢复显示**；切回仿真窗口会再次捕获。
+2. 无法永久在仿真窗口内显示鼠标（**预编译打包的 AirSim 环境无法修改 UE 引擎输入设置，只有源码编译才能关闭鼠标捕获**）。
+
+> 
+> ✅ 不影响你：虽然看不到光标，**鼠标移动依然可以转动相机视角**，这是最关键的。
+
+
+DiffPhysDrone（论文 *Learning vision-based agile flight via differentiable physics*）采用的就是**零样本迁移（zero-shot sim-to-real transfer）**。
+
+**系统辨识【不需要改动 pth 网络权重文件】，完全不动`.pth`。**
+
+区分两件东西
+
+1. **网络权重（pth 文件）**：深度图 → 期望加速度的神经网络，**辨识全程不修改它**，零样本迁移的核心就是 pth 保持原样。
+2. **动力学模型参数**（不是网络参数！）：`hover_thr`、阻力系数 drag、控制延迟 τ、推力滞后等。
+   - 系统辨识干的事：采集真机 IMU / 姿态数据，**优化这一组动力学参数**，替换到 DiffPhysDrone 的**可微物理模拟器**里；
+   - 神经网络本身的权重、网络结构一丝不改，`.pth`文件不变
+  
+
+###  Dajun文件解析
+
+####  export_policy.py
+
+核心逻辑简要解读
+
+1. **设计目的**
+不使用 TorchScript / ONNX。机载飞控侧只有纯 C 代码，没有 PyTorch/ONNX Runtime。网络规模很小，手写 C 前向推理，直接加载扁平化二进制权重文件，开销最小。
+2. **文件结构 policy.bin**
+
+```
+固定Header(魔数、版本、模型超参)
+→ 逐个张量元信息：维度数+shape
+→ 依次写入全部权重：float32小端序，顺序严格按照MANIFEST
+```
+
+> 
+> C 端**按顺序读，不按名字查找张量**，所以 MANIFEST 顺序绝对不能随便调换。
+
+3. **--testvec 的作用（非常关键）**
+导出一组固定输入 + PyTorch 的标准答案输出。
+机载 C 程序上电自动跑这个测试样例；一旦结果对不上，直接判定 C 前向代码存在 bug，**禁止起飞**。用来防范算子手写错误、权重读取字节序错误。
+4. 适配 DDP 训练的 ckpt：自动剔除`module.`前缀。
+
+#### 对应你真机部署的重点
+
+- 这个脚本就是**把 pth 转为机载 C 运行时能直接加载的二进制权重**；**不修改网络本身权重数值**，只是序列化格式转换，零样本迁移流程里导出这一步不会改变策略。
+- 导出后，C 侧必须**完全复现 PyTorch 所有算子（Conv、GRU、Linear）**，`testvec`就是用来验证算子实现一致性。
+- 一旦修改模型结构、增减层，需要同步更新 MANIFEST 并且升级 VERSION，否则 C 端加载张量错位。
+
+#### helicopter_control.py
+
+###### 整体核心解读
+
+> 
+> 这是**DiffPhysDrone 真机部署前端预处理 + 坐标变换 + 控制积分器**，衔接：传感器输入 → 网络推理 → 飞控 ArduPilot。
+> 核心痛点：**仿真使用 FLU 机体坐标系；ArduPilot 飞控标准是 FRD 机体坐标系，导航 NED 坐标系**，两套框架坐标系定义不一样，必须显式转换，否则飞机会反向运动、炸机。
+
+##### 4 个核心函数拆解
+
+1. **prepare_dual_flow()**
+把机载相机原始光流图，做缩放、裁剪、拼接，归一化成网络要求的 `B×4×12×16` 输入。
+双分支：全图光流 + 图像中心区域光流，合并为 4 通道，和仿真训练输入保持完全一致。
+2. **prepare_tof()**
+三路 ToF 深度相机（前、左、右）原始测距（米），归一化编码成 `B×3×30×30`。
+
+> 
+> 规则：近距离 =+1，远距离 / 无回波 =-1；**通道顺序不能乱 front/left/right**，和仿真 render_tof 完全对齐。
+3. **policy_acceleration()**
+网络输出 6 维向量解码：前 3 维是机体 FLU 坐标系期望加速度，后 3 维是预测速度。tanh 把加速度限幅。
+
+> 
+> 网络输出不是直接给飞控的 PWM，是**期望机体加速度**。
+4. **yaw_only_rotation_frd_to_ned()**
+只使用 yaw（偏航角）构造旋转矩阵，**忽略 roll/pitch**。
+
+> 
+> 论文仿真训练就是这么做的，这是非常重要的细节：
+> 如果使用完整姿态 DCM（包含横滚俯仰），无人机倾斜时机体→世界坐标转换会引入额外误差，策略失效。
+
+##### AccelerationVelocityIntegrator 类（控制积分器，部署核心）
+
+作用：把网络输出的**期望加速度**，积分成 ArduPilot 可以接收的 **NED 坐标系速度指令 + 目标 yaw**。
+流程：
+
+1. 坐标系转换 FLU → FRD → NED；
+2. 加速度积分，更新 NED 速度；
+3. 在机体 FLU 坐标系对速度硬限幅（前向最大 3m/s，其余 ±1m/s，和仿真约束一致）；
+4. 融合当前机头朝向与期望速度方向，输出目标偏航，抑制悬停 yaw 抖动；
+5. 返回 NED 速度 + 目标 yaw，发给 ArduPilot 飞控。
+
+真机部署重点坑（你需要重点关注）
+
+1. **坐标系符号**：FLU (前左↑) ↔ FRD (前右↓)，左右、上下轴取反，一旦符号写错飞机反向飞。
+2. **yaw-only 旋转**，不能用完整姿态矩阵。
+3. 预处理逻辑（光流 / ToF 归一化、裁剪、缩放）必须和仿真`env_cuda.py`完全一致，否则输入分布偏移，零样本迁移失效。
+4. 速度限幅是**机体坐标系限幅**，不是世界坐标系。
+5. 不要在代码里额外平滑 yaw_target；ArduPilot 飞控内环自带滞后，额外平滑会造成双重延迟，和仿真动力学不一致。
+
+数据流完整链路（结合前面的 export_policy.py）
+
+```
+ToF相机+光流相机 → prepare_tof() + prepare_dual_flow() → 网络输入
+→ 推理（C runtime加载policy.bin）→ policy_acceleration解码FLU加速度
+→ AccelerationVelocityIntegrator积分+坐标变换 → NED速度指令 + yaw_target
+→ 下发给ArduPilot飞控
+```
