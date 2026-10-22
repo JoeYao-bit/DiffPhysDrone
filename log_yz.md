@@ -1084,3 +1084,581 @@ ToF相机+光流相机 → prepare_tof() + prepare_dual_flow() → 网络输入
 → AccelerationVelocityIntegrator积分+坐标变换 → NED速度指令 + yaw_target
 → 下发给ArduPilot飞控
 ```
+
+20261020
+### 20261020 
+
+目前跟踪目标主要是人
+
+小直飞控还没调试好，暂时无法进行实物测试
+
+目标识别基于武松的yolo开发，rgb相机图像中识别出目标像素坐标
+
+深度信息由tof相机提供，但二者尚未建立对应关系，无法得知rgb图像的像素坐标对应的深度
+
+考虑到DiffPhysDrone项目需要输入指向目标的速度作为参考
+
+可以直接目标框在视觉图像上像素坐标生成参考深度，比如框中心在左侧则往左飞，否则往右飞，在中间则往前飞
+
+是否到达目标附近可以参考头部（大小相对固定）
+
+缺点：会高估前后方向的空间。人头前后更长，基于头部宽度在画面中的大小判断是否到达因为人头部前后宽度大于左右宽度误差较大
+
+如果引入追逐假设，即人在前面走，无人机在后面追，则画面中看到的头部宽度是左右宽度，不同年龄性别下相对固定，误差较小
+
+
+大军给的文档：
+
+### **ToF 采集、发送程序**在这个仓库：
+
+**[xiaopixiong/xiaozhi-ar-lowdelay](https://github.com/xiaopixiong/xiaozhi-ar-lowdelay)**
+
+运行程序名是 **`ar_lowdelay`**，主要代码分工如下：
+
+| 文件 | 功能 |
+|---|---|
+| [jh_ar_lowdelay_tx_tof.c](https://github.com/xiaopixiong/xiaozhi-ar-lowdelay/blob/master/platform/src/jh_ar_lowdelay_tx_tof.c) | 三路 ToF 底层采集、深度解算 |
+| [jh_framework.cpp](https://github.com/xiaopixiong/xiaozhi-ar-lowdelay/blob/master/jh_framework/jh_src/jh_framework.cpp) | `TOF_process()` 接收深度并转交发送模块 |
+| [jh_vins_estimator.cpp](https://github.com/xiaopixiong/xiaozhi-ar-lowdelay/blob/master/jh_framework/jh_src/jh_vins_estimator.cpp) | `estimator_publish_tof()` 将深度、时间戳、内参发送给定位和 Explorer |
+| [jh_uart.cpp](https://github.com/xiaopixiong/xiaozhi-ar-lowdelay/blob/master/jh_framework/jh_src/jh_uart.cpp) | 将定位结果、规划控制目标通过 MAVLink 发给飞控 |
+
+数据链路是：
+
+**ToF 采集 → 深度解算 → IPC 发送 → 定位/探索算法 → MAVLink 发给飞控。**
+
+`TOF-ODOMETRY` 仓库主要放定位算法。**刚才修改的精简录制及相机 640×480、15 Hz 代码还在本地，尚未提交到 GitHub。**
+
+
+![alt text](4263d1f9deace663dff35b8d295e32cb.png)
+
+当前 YOLO 集成在 **`ar_lowdelay` 采集程序内部**，通过配置开关启动，不需要另外运行一个 YOLO 程序。虽然文件名叫 `jh_yolov5.cpp`，实际加载的是 **YOLOv8 模型**。
+
+**1．连接算力板，确认模型文件存在**
+
+```bash
+ssh -i ~/.ssh/uav_explorer root@192.168.3.100
+```
+
+在板端执行：
+
+```bash
+ls -lh /usrdata/param/testkit-1.json \
+       /usrdata/param/YOLOv8sDet_opt.npubin
+```
+
+缺少文件时，需要先上传对应模型和配置。
+
+**2．开启检测**
+
+修改板端 `/usrdata/uav/capture/config/capture.json`：
+
+```json
+"is_yolo_enable": true,
+"yolo_intervel": 15
+```
+
+也可以执行以下命令备份并开启：
+
+```bash
+cp -p /usrdata/uav/capture/config/capture.json \
+      /usrdata/uav/capture/config/capture.json.before-yolo
+
+sed -i 's/"is_yolo_enable"[[:space:]]*:[[:space:]]*false/"is_yolo_enable":true/' \
+    /usrdata/uav/capture/config/capture.json
+```
+
+`yolo_intervel=15` 表示**每15帧检测一次**，不是15 Hz。如果相机输入30 Hz，检测频率约为2 Hz，与刚才设置的图像录制15 Hz是独立的。
+
+**3．重启并检查**
+
+这个开关在程序初始化时读取。**无人机落地、未解锁后**执行：
+
+```bash
+reboot
+```
+
+重新连接后查看：
+
+```bash
+tail -f /mnt/uav-logs/capture.log
+```
+
+出现 `yolov5 out , process cost` 表示已经执行推理；有目标时会打印检测框和置信度。仅出现 `yolov5 init sucess` 还不能证明推理正常。
+
+当前模型配置还设置了 `"allowed_classes": [0]`，即仅保留类别0的检测结果。
+
+---------------------------------------------
+
+### **`ar_lowdelay` 与 `tof_odometry` 通过算力板上的 Unix 域 socket 通信，默认目录是 `/tmp/uav-ipc/`。**
+
+Unix 域 socket 通信是本地进程间通信（IPC）的一种套接字，不走网络协议栈、不走网卡，只在同一台主机内部进程之间传数据；和 TCP/IP socket API 几乎一样，但是地址不是 IP + 端口，而是文件系统上的一个路径名
+
+**当前基线服务已经接收图像，但图像只用于预览，没有参与 ICP／ESKF 定位。**
+
+```mermaid
+flowchart LR
+    A[ar_lowdelay 采集进程] -->|map-record-tof.sock| B[ToF 深度接收与点云转换]
+    A -->|imu.sock| C[IMU 接收与积分]
+    A -->|image.sock| D[图像接收与预览]
+    B --> E[tof_odometry 定位]
+    C --> E
+```
+
+**1. 发送端主要看这个文件**
+
+[jh_vins_estimator.cpp](/media/daotong/30201387201353683/UAV/xiaozhi/ars45-c402-evb-0.17.83-00-20250904_jh20260915/base/customer/apps/ar_lowdelay/jh_framework/jh_src/jh_vins_estimator.cpp:17)
+
+虽然名字中有 `vins_estimator`，这里主要负责**把采集数据打包发送出去**。
+
+| 函数及行号 | 发送内容 | 目的 socket |
+|---|---|---|
+| `estimator_publish_tof()`，95 行 | 三路 ToF 深度、内参、时间戳、传感器编号 | `tof.sock` 和 `map-record-tof.sock` |
+| `estimator_publish_image()`，42 行 | 实时灰度图，480×360，约 10 Hz 上限 | `image.sock` |
+| `estimator_imu_init()`，74 行 | 加速度、角速度及时间戳 | `imu.sock` |
+| `publish_calibration_image()`，17 行 | 原生 640×480 灰度图，目标 15 Hz，用于录制／标定 | `calibration-image.sock` |
+
+这里要区分：**你要求的 640×480、15 Hz 是录制／标定分支；实时定位服务目前接收的仍是另一路 480×360 图像。**
+
+ToF 发送的关键代码是：
+
+```cpp
+// 发给 Explorer
+tx.send("tof.sock", h, payload.data(), payload.size());
+
+// 发给 ToF 定位接收端，目的 socket 存在时发送
+record_tx.send("map-record-tof.sock",
+               h, payload.data(), payload.size());
+```
+
+虽然名字叫 `map-record-tof.sock`，当前基线定位服务实际就是从这里接收 ToF。
+
+发送的是 **210×160 的厂商 uint16 深度容器**，附带内参；不是发送端已经算好的三维点云，也不代表有 210×160 个独立有效测距点。
+
+**2. 采集回调怎样调用发送函数？**
+
+在 [jh_framework.cpp](/media/daotong/30201387201353683/UAV/xiaozhi/ars45-c402-evb-0.17.83-00-20250904_jh20260915/base/customer/apps/ar_lowdelay/jh_framework/jh_src/jh_framework.cpp:266)：
+
+```cpp
+// 相机回调：266 行附近
+RGB_640_480_process(...)
+    → estimator_publish_image(...)
+
+// ToF 回调：450 行附近
+TOF_process(...)
+    → estimator_publish_tof(...)
+```
+
+ToF 更上游的深度处理入口在 [jh_ar_lowdelay_tx_tof.c:1447](/media/daotong/30201387201353683/UAV/xiaozhi/ars45-c402-evb-0.17.83-00-20250904_jh20260915/base/customer/apps/ar_lowdelay/platform/src/jh_ar_lowdelay_tx_tof.c:1447)：先进行深度图方向校正，再调用 `TOF_process()`，传入 SDK 的 `u64MNPTS` 时间戳。
+
+**3. `tof_odometry` 在哪里接收？**
+
+主要看 [baseline_service.cpp:31](/media/daotong/30201387201353683/UAV/xiaozhi/tof_odometry/live/baseline_service.cpp:31)：
+
+```cpp
+uav::Receiver tof("map-record-tof.sock");
+uav::Receiver image("image.sock", ...);
+ImuInbox imu;  // 默认接收 imu.sock
+```
+
+主循环在 63 行附近接收、检查消息，再分别处理：
+
+| 数据 | 后续处理 |
+|---|---|
+| ToF | 78 行调用 `g.project()`，转换成点云，放入对应传感器队列 |
+| IMU | 74 行读取加速度和角速度，推进姿态估计；另有异步接收与传播 |
+| 图像 | 80 行缩小图像，通过 `VINS_IMAGE` 发送诊断预览 |
+
+深度转点云的实现位于 [sensors.hpp:22](/media/daotong/30201387201353683/UAV/xiaozhi/tof_odometry/live/sensors.hpp:22) 的 `Geometry::project()`。
+
+**4. socket 通信本身在哪里实现？**
+
+在共享库 [uav_ipc.hpp:114](/media/daotong/30201387201353683/UAV/xiaozhi/uav_ipc/include/uav_ipc.hpp:114)：
+
+- `Sender::send()`：用非阻塞 `sendmsg()` 发送消息头和数据；
+- `Receiver::receive()`：用 `recv()` 接收并校验消息；
+- 消息头包含类型、时间戳、序号、传感器编号、图像宽高；
+- 发送失败会累计丢包计数，不能把“调用了发送函数”等同于接收成功。
+
+**如果下一步接入 FAST-LIVO2 式视觉融合，重点改的是接收后的图像处理链路。** 目前数据已经能送到 `baseline_service.cpp`，但还需要增加视觉地图点、参考图像块、图像匹配和视觉残差更新，才算真正让图像参与定位。
+
+### 技术问题讨论记录
+
+武松：目标离飞机的距离怎么判断呢？
+yz:有两个思路，一个是比较完善的思路，关联rgb图像和tof图像，得到rgd像素对应的深度，然后得到相对位姿包括距离
+还有一种比较取巧的思路，人体轮廓比如头部宽度相对固定，可以提前采集不同距离下人体头部在rgb相机上的像素框宽yz:度，使用时根据像素框宽度查表插值得到近似的距离
+第一种理论上限更高，但开发比较复杂，因为rgb相机和tof相机所拍摄的区域并不完全一致，因此rgb图像中的像素框可能超出tof拍摄的范围，导致无法获得深度；以及不同相机参数想让像素对应需要标定
+第二种开发简单很多，但是精确性可能不够，因为人体姿态可能会倾斜导致像素框宽度变大；以及如果后续换成人以外的其他跟踪对象这套方法就不好用了
+武松：我觉得两种方案可以一起用，深度点云里能找到目标就用点云深度，找不到就用头部宽度预估
+
+武松：tof的fov是60*45°（大军：30*30像素，900个点），RGB是152×129°，深度图找不到目标的可能性还挺大的，我觉得两种方案可以一起用，深度点云里能找到目标就用点云深度，找不到就用头部宽度预估
+
+yz:好的，目前我想到的办法是假设目标被遮挡后仍留在消失前的位置，然后控制无人机飞到这个位置，如果重新看到目标则继续跟踪，否则停在这个位置
+
+武松：我觉得可以
+
+
+### 关键仓库
+
+大军维护的修改过的DiffPhysDrone项目仓库：
+https://github.com/xiaopixiong/HenryHuYu-DiffPhysDrone-0915
+
+大军的ToF采集发送仓库：
+
+https://github.com/xiaopixiong/xiaozhi-ar-lowdelay
+
+DiffPhysDrone采用图像是16 × 12大小，
+为什么分辨率固定
+
+- CNN 卷积层权重是在 12×16 尺寸上训练收敛的；
+- 网络的输入张量 shape 硬编码；**推理时如果尺寸不对，无法前向传播，pth 权重不能直接使用**；
+- 主论文正文和附录都明确：训练、仿真评估、真机部署，**预处理链路完全一致，保证 sim-to-real 迁移**
+
+接下来计划
+
+跑通获取原始ToF图像
+
+跑通获取yolo8检测人体结果，得到人对应的图像框，以及了解是否可以头部检测
+
+
+头部检测需要左右耳或者左右瞳孔间距，
+
+或者使用肩宽更加稳定（指不易被遮挡），
+成年男肩宽≈370mm，头宽≈158mm；女肩宽≈340mm，头宽≈151mm，男女肩宽差距不大
+
+
+获取tof数据
+
+获取yolo8结果，带肩宽数据
+
+可以通过遥控器看到图像以及自定义显示？
+
+等转接板过来做实验
+
+
+### 20261022 小直使用说明
+
+USB线连接算力板，一端连接无人机头部上方左侧接口，另一端接笔记本电脑
+
+小直运行时必须吹小风扇，不然温度过高会烧坏
+
+小直遥控器上有两个app,一个是小直本身飞控，
+
+遥控器和飞机配对，点击左上角，fly控制飞行，plan规划路径飞行
+
+左侧摇杆控制上下左右，右侧摇杆控制前后
+
+地面上起飞需要解锁
+
+setting->common link->pair
+
+飞机头部右侧上方有个小按钮点击配对
+
+Lotier是一种飞行模式，手动摇杆控制
+
+Guided另一种飞行模式,程序发指令自己去飞
+
+左边中间有白点的方形按钮解锁主桨，右边类似按钮解锁副桨
+
+严格先解锁主桨再解锁副桨
+
+左侧边缘长方形按钮切换飞行模式
+
+左上角显示not ready解锁无效，ready才有效
+
+下后方蓝色小灯是光流传感器，获取相对位姿变化，不太准
+
+遥控器采用安卓系统
+
+遥控器上有算力板、飞机上有算力板，直接通信，
+
+飞机上的算力板和飞控通过mavlink通信
+
+### 小直连接ubuntu系统方法
+正常情况下，小直通过USB连接ubuntu系统
+Settings->Network会弹出USB Ethernet,
+点击齿轮图标进入Network options
+进入IPV4配置，
+IPV4 method选择手动，即Manual
+Address: 192.168.3.10, Netmask:255.255.255.0,
+框选use this connection only for resources on its network
+Apply后在终端输入ping 192.168.3.100即可ping通
+ping通后打开终端输入：
+ssh -o HostKeyAlgorithms=+ssh-rsa root@192.168.3.100
+再输入密码artosyn即可通过
+
+所有小直共用一个ssh地址
+用户名root
+ssh地址root@192.168.3.100
+192.168.3.100
+密码：
+artosyn
+
+
+
+遥控器开关位于右下角，圆形按钮，长按开机，长按关机
+
+![alt text](99d1215b7c957abff2eebbdb71fbe29c.jpg)
+
+小直电池安装方式
+
+![alt text](0f269e275a6564234b6fc1e48c75c89b.jpg)
+
+![alt text](4b1afb791a025cb7cb30f5e78c2beb76.jpg)
+
+电池充电视频
+
+<video controls src="0dc119ce4cfeda60c128f0e62f64cc9f.mp4" title="Title"></video>
+
+
+电池正负，左正右负
+
+![alt text](db9ab0626333283202828bf622de1af4.jpg)
+
+充电器
+正正对应，负负对应
+![alt text](9696c6f52b11b85d036b0ea04ed50287.jpg)
+
+充满8.4V
+
+小直没有电源开关，插上电池等于上电，拔下电池等于断电。
+
+### 20261022 实机测试分三步：
+
+1,获取数据
+
+rgb图像数据、
+tof数据、
+yolo的人体骨骼检测数据
+无人机当前飞行速度
+
+(通过遥控器app无线查看)
+
+2，跑通流程
+
+根据骨骼检测计算追踪速度，
+
+将追踪速度和tof喂给神经网络，得到速度指令，
+
+下发给无人机飞控
+
+3,实机测试
+
+无障碍跟踪人飞行
+
+有障碍无遮挡跟踪人飞行
+
+有障碍有遮挡跟踪人飞行
+
+大军的部署文档：
+
+～/code/DiffPhysDrone/Dajun-260915/DEPLOYMENT_GUIDE.md
+
+
+
+```
+vim 文件名
+sudo vim /etc/xxx.service
+```
+
+vim 基础操作：
+
+1. 打开后默认**命令模式**，按 `i` 进入【插入模式】，才能打字修改
+2. 改完，按 `Esc` 退回命令模式
+3. 输入 `:w` 保存，`：q` 退出；`:wq` 保存并退出
+4. 改坏不想保存：`:q!` 强制退出不保存
+
+用cat编辑命令
+
+所有程序启动的起点
+
+/usrdata/run.sh
+
+所有开发代码都在/usrdata/uav目录下
+
+图片无法实时查看
+只能通过
+
+
+无人机实时数据可视化需要通过遥控器上app实现，
+遥控器安卓系统
+写入程序通过手柄最左侧usb口进行
+
+app链接如下
+https://github.com/xiaopixiong/xiaozhi-ground-station
+
+小直的Linux系统为
+
+```
+Linux art_sirius 4.9.38 #45 SMP Mon Jul 27 18:32:46 PDT 2026 aarch64 GNU/Linux
+```
+
+有一个12G的硬盘可以保存数据
+
+- `art_sirius`：主机名
+- `4.9.38`：内核版本（非常老的 4.9 LTS）
+- `aarch64`：**ARM64（ARMv8）架构**
+- 不是标准 Ubuntu 桌面 / 服务器，是**定制嵌入式 Linux**（大概率 Buildroot / Yocto / 厂商自研根文件系统），所以没有 `/etc/os-release`、lsb_release 一般也没有
+
+从小直复制文件(/etc/init.d/{start.sh,start_app.sh})到本地
+
+scp -O -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa root@192.168.3.100:/etc/init.d/start.sh ./
+
+### 小直开机启动时脚本调用顺序：
+/etc/init.d/start.sh -> /usrdata/run.sh -> /usrdata/uav/boot-all.sh -> { capture/ar_lowdelay capture/service.sh vins/service.sh tof/tof_service }
+
+
+/usrdata/run.sh 内容如下
+
+```
+#!/bin/sh
+echo "run ..."
+
+# binder service manger，启动binder跨进程通信管理服务，供板上多媒体驱动/服务使用
+servicemanager &
+
+# kernel loglevel: KERNEL_INFO
+# 设置内核控制台打印级别为1，仅最高紧急级别内核消息才输出，减少串口日志刷屏
+echo 1 > /proc/sys/kernel/printk
+
+# mount /dev/mmcblk0p10 to /mnt
+# 挂载eMMC分区mmcblk0p9到/mnt，文件系统格式ext4
+mount -t ext4 /dev/mmcblk0p9 /mnt
+# 判断上一条mount命令返回值，非0代表挂载失败
+if [ $? -ne 0 ]; then
+    # 挂载失败：格式化该分区为ext4，再重新挂载
+    /etc/mkfs.ext4 /dev/mmcblk0p9
+    mount -t ext4 /dev/mmcblk0p9 /mnt
+fi
+
+# start rndis and mtp for debug
+# 执行usb gadget配置脚本，启用RNDIS虚拟网卡（就是你192.168.3.100）+MTP调试
+/etc/usb_gadget_configfs.sh rndis+mtp 0 dwc2_9411_0 0x1d6b 0x0200 0
+
+# 启动dropbear ssh服务，【无&前台阻塞！脚本会停在这里，ssh进程退出后才继续往下执行后续代码】
+dropbear
+
+# 如果ar813x配套启动脚本存在，则执行（一般是WiFi模组相关业务）
+if [ -e "/usrdata/ar813x/start_ar813x.sh" ]; then
+    /usrdata/ar813x/start_ar813x.sh
+fi
+
+# 等待2秒
+sleep 2
+
+# 下面if分支条件判断无实际效果，两个分支执行完全一样的命令：启动无人机业务总脚本，后台运行
+if [ $need_dumplog == 1 ]; then
+	/usrdata/uav/boot-all.sh &
+else
+	/usrdata/uav/boot-all.sh &
+fi
+
+# test 4 ads6401 ToF sensor
+#test_mpp_vio -index 6401 -use_board_cfg 0 &
+# test timo256 sensor
+#test_mpp_vio -index 216 -send_to_net 1 &
+```
+
+boot-all.sh内容
+
+```
+#!/bin/sh
+# Board boot: verify platform prerequisites, then start capture and ToF once.
+# Explorer remains manually controlled. No repeated SDK restart on failure.
+# 板子上电启动脚本：校验平台前置依赖，只启动一次图像采集、ToF服务；业务程序由外部手动控制，失败不会自动反复重启SDK
+set -u
+# 遇到未定义变量直接报错退出
+root=${UAV_ROOT:-/usrdata/uav}
+# UAV_ROOT环境变量优先，默认业务根目录 /usrdata/uav
+dev=${UAV_DEV_ROOT:-/dev}
+# 设备节点根路径，默认 /dev
+proc=${UAV_PROC_ROOT:-/proc}
+# proc文件系统路径，默认 /proc
+ipc=${UAV_IPC_DIR:-/tmp/uav-ipc}
+# 进程间通信状态文件存放目录
+logfile=${UAV_BOOT_LOG:-/tmp/uav-boot-ready.log}
+# 启动日志文件路径
+timeout=${UAV_BOOT_READY_TIMEOUT:-30}
+# 平台就绪最大等待超时：默认30秒
+stream_timeout=${UAV_STREAM_READY_TIMEOUT:-45}
+# 传感器数据流就绪最大等待超时：默认45秒
+
+# 校验超时参数只能是数字，非法字符直接退出
+case "$timeout:$stream_timeout" in *[!0-9:]*|:*|*:) echo 'invalid boot timeout' >&2; exit 2;; esac
+
+# 日志函数：打印自系统开机以来的时间 + 日志内容，追加写入日志文件
+log() { printf '%s %s\n' "$(cut -d ' ' -f 1 "$proc/uptime" 2>/dev/null)" "$*" >>"$logfile"; }
+
+# 平台就绪检测函数：检查所有硬件节点、进程、挂载、可执行文件、配置文件是否齐备
+platform_ready() {
+ reason=
+ # 依次检查binder、mpp、sys、vb等必需设备节点是否存在（字符设备）
+ for node in binder ar_mpp_ctl ar_sys ar_vb; do
+  if [ ! -c "$dev/$node" ]; then reason="missing device $node"; return 1; fi
+ done
+ # 检查servicemanager（binder服务管理）是否正在运行
+ if ! pidof servicemanager >/dev/null; then reason='servicemanager not running'; return 1; fi
+ # 检查平台后台daemon进程是否运行
+ if ! pidof daemon >/dev/null; then reason='platform daemon not running'; return 1; fi
+ # 检查/mnt分区是否已经挂载
+ if ! grep -q ' /mnt ' "$proc/mounts"; then reason='/mnt not mounted'; return 1; fi
+ # 检查核心业务程序是否存在并且拥有执行权限
+ for file in capture/ar_lowdelay capture/service.sh vins/service.sh tof/tof_service; do
+  if [ ! -x "$root/$file" ]; then reason="missing executable $file"; return 1; fi
+ done
+ # 检查配置文件是否存在且非空
+ for file in capture/config/capture.json tof/geometry.conf; do
+  if [ ! -s "$root/$file" ]; then reason="missing configuration $file"; return 1; fi
+ done
+ return 0
+}
+
+# 入参 --check 模式：仅做一次平台可用性检查，适合外部脚本探测状态
+if [ "${1:-}" = --check ]; then
+ if platform_ready; then echo 'platform prerequisites ready'; exit 0; fi
+ echo "$reason"; exit 1
+fi
+
+# 锁文件，防止脚本重复并发执行
+lock=${UAV_BOOT_LOCK:-/tmp/uav-boot-ready.lock}
+if ! mkdir "$lock" 2>/dev/null; then log 'boot already in progress'; exit 0; fi
+# 脚本退出时自动清理锁目录
+trap 'rmdir "$lock" 2>/dev/null || :' EXIT
+# 收到TERM、INT信号直接退出
+trap 'exit 1' TERM INT
+
+log 'waiting for platform prerequisites'
+i=0;stable=0
+# 循环轮询，等待平台所有前置条件就绪，最长等待timeout秒
+while [ "$i" -le "$timeout" ]; do
+ if platform_ready; then stable=$((stable+1)); else stable=0; log "waiting: $reason"; fi
+ # 需要连续2次检测都就绪才判定稳定，规避设备节点刚创建、还未完全初始化的瞬态问题
+ [ "$stable" -ge 2 ] && break
+ [ "$i" -ge "$timeout" ] && { log "platform timeout: ${reason:-not stable}"; exit 1; }
+ sleep 1;i=$((i+1))
+done
+log "platform ready after ${i}s polling; starting capture"
+
+# 启动采集服务，输出日志到logfile；启动失败则记录日志并退出
+if ! "$root/capture/service.sh" start >>"$logfile" 2>&1; then log 'capture start failed'; exit 1; fi
+# Create receivers immediately; the algorithms wait for real samples themselves.
+# 立刻启动接收端，算法内部自己等待传感器有效数据，不等这里阻塞
+# 启动VINS+ToF服务，注释写ToF start failed是原文注释笔误
+if ! "$root/vins/service.sh" start >>"$logfile" 2>&1; then log 'ToF start failed'; exit 1; fi
+
+log 'capture and ToF started; waiting for IMU and three ToF streams'
+i=0
+# 轮询等待传感器数据流上报，最长stream_timeout秒
+while [ "$i" -le "$stream_timeout" ]; do
+ status="$ipc/tof.status.json"
+ # Live atomic status: nonzero counters prove receipt, not pose initialization.
+ # 读取状态json：imu计数、三路tof计数大于0，代表已经收到传感器原始数据；不等于定位解算完成
+ if [ -r "$status" ] && grep -Eq '"imu":[1-9][0-9]*' "$status" && grep -Eq '"tof":\[[1-9][0-9]*,[1-9][0-9]*,[1-9][0-9]*\]' "$status"; then
+  log "all sensor streams received after ${i}s; boot complete (pose still has its own initialization)"; exit 0
+ fi
+ # 数据流超时：服务继续保留运行，不会自动重启SDK
+ [ "$i" -ge "$stream_timeout" ] && { log 'sensor stream timeout; services left running, no automatic SDK restart'; exit 1; }
+ sleep 1;i=$((i+1))
+done
+
+```
+可执行文件PC端编译，然后把可执行文件复制到小直相关目录
